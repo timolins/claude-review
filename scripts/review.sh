@@ -7,6 +7,9 @@ MAX_PROMPT_CHARS="${REVIEW_MAX_PROMPT_CHARS:-180000}"
 MAX_DIFF_CHARS="${REVIEW_MAX_DIFF_CHARS:-120000}"
 MAX_WORKTREE_CHARS="${REVIEW_MAX_WORKTREE_CHARS:-40000}"
 REVIEW_STREAM_JSON="${REVIEW_STREAM_JSON:-1}"
+REVIEW_LIVE_PREVIEW_MIN_CHARS="${REVIEW_LIVE_PREVIEW_MIN_CHARS:-160}"
+REVIEW_LIVE_PREVIEW_INTERVAL_SEC="${REVIEW_LIVE_PREVIEW_INTERVAL_SEC:-0}"
+REVIEW_LIVE_PREVIEW_MIN_EMIT_CHARS="${REVIEW_LIVE_PREVIEW_MIN_EMIT_CHARS:-60}"
 
 if [ "${1:-}" = "-c" ]; then
   CONTINUE=true
@@ -81,27 +84,35 @@ render_stream_json() {
   local event
   local printed_any_text=false
   local open_text_block=false
+  local preview_buffer=""
+  local preview_last_emit=0
   local result_error="false"
   local result_duration_ms=""
   local result_cost=""
   local result_text=""
   local saw_result=false
+  local raw_line
 
-  while IFS= read -r event; do
-    if [ -z "$event" ]; then
+  while IFS= read -r raw_line; do
+    if [ -z "$raw_line" ]; then
       continue
     fi
 
-    local event_kind payload
-    if [[ "$event" == *$'\t'* ]]; then
-      event_kind="${event%%$'\t'*}"
-      payload="${event#*$'\t'}"
-    else
-      event_kind="$event"
-      payload=""
-    fi
+    while IFS= read -r event; do
+      if [ -z "$event" ]; then
+        continue
+      fi
 
-    case "$event_kind" in
+      local event_kind payload
+      if [[ "$event" == *$'\t'* ]]; then
+        event_kind="${event%%$'\t'*}"
+        payload="${event#*$'\t'}"
+      else
+        event_kind="$event"
+        payload=""
+      fi
+
+      case "$event_kind" in
       INIT)
         local model_b64 session_id_b64 model session_id
         if [[ "$payload" == *$'\t'* ]]; then
@@ -173,9 +184,47 @@ render_stream_json() {
           printf "%s" "$text"
           printed_any_text=true
           open_text_block=true
+          preview_buffer+="$text"
+
+          local now should_emit_preview=false
+          now="$(date +%s)"
+
+          if [ "${#preview_buffer}" -ge "$REVIEW_LIVE_PREVIEW_MIN_CHARS" ]; then
+            should_emit_preview=true
+          fi
+
+          if [ "$REVIEW_LIVE_PREVIEW_INTERVAL_SEC" -gt 0 ] && \
+             [ "$preview_last_emit" -ne 0 ] && \
+             [ $((now - preview_last_emit)) -ge "$REVIEW_LIVE_PREVIEW_INTERVAL_SEC" ] && \
+             [ "${#preview_buffer}" -ge "$REVIEW_LIVE_PREVIEW_MIN_EMIT_CHARS" ]; then
+            should_emit_preview=true
+          fi
+
+          if [[ "$preview_buffer" == *$'\n'* ]] && [ "${#preview_buffer}" -ge "$REVIEW_LIVE_PREVIEW_MIN_EMIT_CHARS" ]; then
+            should_emit_preview=true
+          fi
+
+          if [ "$should_emit_preview" = true ]; then
+            local preview
+            preview="$(shorten_line "$(sanitize_line "$preview_buffer")" 220)"
+            if [ -n "$preview" ]; then
+              log_review "Draft: $preview"
+            fi
+            preview_buffer=""
+            preview_last_emit="$now"
+          fi
         fi
         ;;
       MESSAGE_STOP)
+        if [ -n "$preview_buffer" ]; then
+          local preview
+          preview="$(shorten_line "$(sanitize_line "$preview_buffer")" 220)"
+          if [ -n "$preview" ]; then
+            log_review "Draft: $preview"
+          fi
+          preview_buffer=""
+        fi
+
         if [ "$open_text_block" = true ]; then
           printf "\n"
           open_text_block=false
@@ -212,37 +261,39 @@ render_stream_json() {
 
         result_text="$(decode_b64 "$result_text_b64" 2>/dev/null || true)"
         ;;
-    esac
-  done < <(
-    jq -r '
-      def b64(value): (value // "" | @base64);
-      if .type == "system" and .subtype == "init" then
-        "INIT\t" + b64(.model) + "\t" + b64(.session_id)
-      elif .type == "system" and .subtype == "hook_started" then
-        "HOOK\t" + b64(.hook_name)
-      elif .type == "assistant" then
-        (.message.content[]? | select(.type == "tool_use") |
-          "TOOL_USE\t" + b64(.name) + "\t" + b64(.input.description // .input.command))
-      elif .type == "user" and (.tool_use_result != null) then
-        "TOOL_DONE\t" +
-        ((((.message.content[]? | select(.type == "tool_result") | .is_error) // false) | tostring)) +
-        "\t" +
-        b64(.tool_use_result.stdout // .tool_use_result.stderr)
-      elif .type == "stream_event" and .event.type == "content_block_delta" and .event.delta.type == "text_delta" then
-        "TEXT\t" + b64(.event.delta.text)
-      elif .type == "stream_event" and .event.type == "message_stop" then
-        "MESSAGE_STOP"
-      elif .type == "result" then
-        "RESULT\t" +
-        ((.is_error // false) | tostring) + "\t" +
-        ((.duration_ms // "") | tostring) + "\t" +
-        ((.total_cost_usd // "") | tostring) + "\t" +
-        b64(.result)
-      else
-        empty
-      end
-    ' 2>/dev/null
-  )
+      esac
+    done < <(
+      printf '%s\n' "$raw_line" | jq -Rr '
+        def b64(value): (value // "" | @base64);
+        (try fromjson catch empty) as $j |
+        if $j.type == "system" and $j.subtype == "init" then
+          "INIT\t" + b64($j.model) + "\t" + b64($j.session_id)
+        elif $j.type == "system" and $j.subtype == "hook_started" then
+          "HOOK\t" + b64($j.hook_name)
+        elif $j.type == "assistant" then
+          ($j.message.content[]? | select(.type == "tool_use") |
+            "TOOL_USE\t" + b64(.name) + "\t" + b64(.input.description // .input.command))
+        elif $j.type == "user" and ($j.tool_use_result != null) then
+          "TOOL_DONE\t" +
+          (((($j.message.content[]? | select(.type == "tool_result") | .is_error) // false) | tostring)) +
+          "\t" +
+          b64($j.tool_use_result.stdout // $j.tool_use_result.stderr)
+        elif $j.type == "stream_event" and $j.event.type == "content_block_delta" and $j.event.delta.type == "text_delta" then
+          "TEXT\t" + b64($j.event.delta.text)
+        elif $j.type == "stream_event" and $j.event.type == "message_stop" then
+          "MESSAGE_STOP"
+        elif $j.type == "result" then
+          "RESULT\t" +
+          (($j.is_error // false) | tostring) + "\t" +
+          (($j.duration_ms // "") | tostring) + "\t" +
+          (($j.total_cost_usd // "") | tostring) + "\t" +
+          b64($j.result)
+        else
+          empty
+        end
+      ' 2>/dev/null || true
+    )
+  done
 
   if [ "$open_text_block" = true ]; then
     printf "\n"

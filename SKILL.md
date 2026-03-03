@@ -46,6 +46,15 @@ REVIEW_MAX_PROMPT_CHARS=180000 REVIEW_MAX_DIFF_CHARS=120000 REVIEW_MAX_WORKTREE_
 
 This keeps the review responsive on large branches while still giving Claude enough context.
 
+You can also tune live preview verbosity (stream mode):
+
+```bash
+REVIEW_LIVE_PREVIEW_MIN_CHARS=160 REVIEW_LIVE_PREVIEW_MIN_EMIT_CHARS=60 REVIEW_LIVE_PREVIEW_INTERVAL_SEC=0 ~/.agents/skills/claude-review/scripts/review.sh
+```
+
+`REVIEW_LIVE_PREVIEW_INTERVAL_SEC=0` keeps previews event-driven (newlines/sentence boundaries/message end).  
+Set it to `>0` only if you want periodic timer-based previews for very long single-line outputs.
+
 Live progress is enabled by default (Claude stream JSON is parsed and shown as it runs).  
 Set `REVIEW_STREAM_JSON=0` to fall back to plain `claude --print` output:
 
