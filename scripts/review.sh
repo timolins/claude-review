@@ -24,43 +24,18 @@ if ! command -v claude >/dev/null 2>&1; then
 fi
 
 CLAUDE_FLAGS=(--print --allowedTools "Read,Grep,Glob,Bash(git:*)")
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+STREAM_RENDERER_SCRIPT="$SCRIPT_DIR/render-stream.mjs"
+STREAM_RENDERER_CMD=()
 
-if printf "dGVzdA==" | base64 --decode >/dev/null 2>&1; then
-  BASE64_DECODE_CMD=(base64 --decode)
-else
-  BASE64_DECODE_CMD=(base64 -D)
+if command -v bun >/dev/null 2>&1; then
+  STREAM_RENDERER_CMD=(bun "$STREAM_RENDERER_SCRIPT")
+elif command -v node >/dev/null 2>&1; then
+  STREAM_RENDERER_CMD=(node "$STREAM_RENDERER_SCRIPT")
 fi
 
 log_review() {
   printf "[review] %s\n" "$*" >&2
-}
-
-decode_b64() {
-  local payload="${1:-}"
-  if [ -z "$payload" ]; then
-    return 0
-  fi
-
-  printf "%s" "$payload" | "${BASE64_DECODE_CMD[@]}"
-}
-
-sanitize_line() {
-  local text="${1:-}"
-  text="${text//$'\n'/ }"
-  text="${text//$'\r'/ }"
-  text="${text//$'\t'/ }"
-  printf "%s" "$text"
-}
-
-shorten_line() {
-  local text="$1"
-  local max_len="${2:-140}"
-  if [ "${#text}" -le "$max_len" ]; then
-    printf "%s" "$text"
-    return
-  fi
-
-  printf "%s..." "${text:0:max_len}"
 }
 
 truncate_text() {
@@ -81,251 +56,22 @@ truncate_text() {
 }
 
 render_stream_json() {
-  local event
-  local printed_any_text=false
-  local open_text_block=false
-  local preview_buffer=""
-  local preview_last_emit=0
-  local result_error="false"
-  local result_duration_ms=""
-  local result_cost=""
-  local result_text=""
-  local saw_result=false
-  local raw_line
-
-  while IFS= read -r raw_line; do
-    if [ -z "$raw_line" ]; then
-      continue
-    fi
-
-    while IFS= read -r event; do
-      if [ -z "$event" ]; then
-        continue
-      fi
-
-      local event_kind payload
-      if [[ "$event" == *$'\t'* ]]; then
-        event_kind="${event%%$'\t'*}"
-        payload="${event#*$'\t'}"
-      else
-        event_kind="$event"
-        payload=""
-      fi
-
-      case "$event_kind" in
-      INIT)
-        local model_b64 session_id_b64 model session_id
-        if [[ "$payload" == *$'\t'* ]]; then
-          model_b64="${payload%%$'\t'*}"
-          session_id_b64="${payload#*$'\t'}"
-        else
-          model_b64="$payload"
-          session_id_b64=""
-        fi
-
-        model="$(decode_b64 "$model_b64" 2>/dev/null || true)"
-        session_id="$(decode_b64 "$session_id_b64" 2>/dev/null || true)"
-        if [ -n "$session_id" ]; then
-          log_review "Session $session_id started (${model:-unknown model})."
-        else
-          log_review "Session started (${model:-unknown model})."
-        fi
-        ;;
-      HOOK)
-        local hook_name
-        hook_name="$(decode_b64 "$payload" 2>/dev/null || true)"
-        if [ -n "$hook_name" ]; then
-          log_review "Hook: $(shorten_line "$(sanitize_line "$hook_name")" 140)"
-        fi
-        ;;
-      TOOL_USE)
-        local tool_name_b64 detail_b64 tool_name detail
-        if [[ "$payload" == *$'\t'* ]]; then
-          tool_name_b64="${payload%%$'\t'*}"
-          detail_b64="${payload#*$'\t'}"
-        else
-          tool_name_b64="$payload"
-          detail_b64=""
-        fi
-
-        tool_name="$(decode_b64 "$tool_name_b64" 2>/dev/null || true)"
-        detail="$(decode_b64 "$detail_b64" 2>/dev/null || true)"
-        detail="$(shorten_line "$(sanitize_line "$detail")" 140)"
-        if [ -n "$detail" ]; then
-          log_review "Claude is running ${tool_name}: $detail"
-        else
-          log_review "Claude is running ${tool_name}."
-        fi
-        ;;
-      TOOL_DONE)
-        local tool_error output_b64 tool_output preview
-        if [[ "$payload" == *$'\t'* ]]; then
-          tool_error="${payload%%$'\t'*}"
-          output_b64="${payload#*$'\t'}"
-        else
-          tool_error="false"
-          output_b64="$payload"
-        fi
-
-        tool_output="$(decode_b64 "$output_b64" 2>/dev/null || true)"
-        preview="$(shorten_line "$(sanitize_line "$tool_output")" 140)"
-        if [ -n "$preview" ]; then
-          if [ "$tool_error" = "true" ]; then
-            log_review "Tool output (error): $preview"
-          else
-            log_review "Tool output: $preview"
-          fi
-        fi
-        ;;
-      TEXT)
-        local text
-        text="$(decode_b64 "$payload" 2>/dev/null || true)"
-        if [ -n "$text" ]; then
-          printf "%s" "$text"
-          printed_any_text=true
-          open_text_block=true
-          preview_buffer+="$text"
-
-          local now should_emit_preview=false
-          now="$(date +%s)"
-
-          if [ "${#preview_buffer}" -ge "$REVIEW_LIVE_PREVIEW_MIN_CHARS" ]; then
-            should_emit_preview=true
-          fi
-
-          if [ "$REVIEW_LIVE_PREVIEW_INTERVAL_SEC" -gt 0 ] && \
-             [ "$preview_last_emit" -ne 0 ] && \
-             [ $((now - preview_last_emit)) -ge "$REVIEW_LIVE_PREVIEW_INTERVAL_SEC" ] && \
-             [ "${#preview_buffer}" -ge "$REVIEW_LIVE_PREVIEW_MIN_EMIT_CHARS" ]; then
-            should_emit_preview=true
-          fi
-
-          if [[ "$preview_buffer" == *$'\n'* ]] && [ "${#preview_buffer}" -ge "$REVIEW_LIVE_PREVIEW_MIN_EMIT_CHARS" ]; then
-            should_emit_preview=true
-          fi
-
-          if [ "$should_emit_preview" = true ]; then
-            local preview
-            preview="$(shorten_line "$(sanitize_line "$preview_buffer")" 220)"
-            if [ -n "$preview" ]; then
-              log_review "Draft: $preview"
-            fi
-            preview_buffer=""
-            preview_last_emit="$now"
-          fi
-        fi
-        ;;
-      MESSAGE_STOP)
-        if [ -n "$preview_buffer" ]; then
-          local preview
-          preview="$(shorten_line "$(sanitize_line "$preview_buffer")" 220)"
-          if [ -n "$preview" ]; then
-            log_review "Draft: $preview"
-          fi
-          preview_buffer=""
-        fi
-
-        if [ "$open_text_block" = true ]; then
-          printf "\n"
-          open_text_block=false
-        fi
-        ;;
-      RESULT)
-        local remaining result_text_b64
-        saw_result=true
-        remaining="$payload"
-
-        if [[ "$remaining" == *$'\t'* ]]; then
-          result_error="${remaining%%$'\t'*}"
-          remaining="${remaining#*$'\t'}"
-        else
-          result_error="$remaining"
-          remaining=""
-        fi
-
-        if [[ "$remaining" == *$'\t'* ]]; then
-          result_duration_ms="${remaining%%$'\t'*}"
-          remaining="${remaining#*$'\t'}"
-        else
-          result_duration_ms="$remaining"
-          remaining=""
-        fi
-
-        if [[ "$remaining" == *$'\t'* ]]; then
-          result_cost="${remaining%%$'\t'*}"
-          result_text_b64="${remaining#*$'\t'}"
-        else
-          result_cost="$remaining"
-          result_text_b64=""
-        fi
-
-        result_text="$(decode_b64 "$result_text_b64" 2>/dev/null || true)"
-        ;;
-      esac
-    done < <(
-      printf '%s\n' "$raw_line" | jq -Rr '
-        def b64(value): (value // "" | @base64);
-        (try fromjson catch empty) as $j |
-        if $j.type == "system" and $j.subtype == "init" then
-          "INIT\t" + b64($j.model) + "\t" + b64($j.session_id)
-        elif $j.type == "system" and $j.subtype == "hook_started" then
-          "HOOK\t" + b64($j.hook_name)
-        elif $j.type == "assistant" then
-          ($j.message.content[]? | select(.type == "tool_use") |
-            "TOOL_USE\t" + b64(.name) + "\t" + b64(.input.description // .input.command))
-        elif $j.type == "user" and ($j.tool_use_result != null) then
-          "TOOL_DONE\t" +
-          (((($j.message.content[]? | select(.type == "tool_result") | .is_error) // false) | tostring)) +
-          "\t" +
-          b64($j.tool_use_result.stdout // $j.tool_use_result.stderr)
-        elif $j.type == "stream_event" and $j.event.type == "content_block_delta" and $j.event.delta.type == "text_delta" then
-          "TEXT\t" + b64($j.event.delta.text)
-        elif $j.type == "stream_event" and $j.event.type == "message_stop" then
-          "MESSAGE_STOP"
-        elif $j.type == "result" then
-          "RESULT\t" +
-          (($j.is_error // false) | tostring) + "\t" +
-          (($j.duration_ms // "") | tostring) + "\t" +
-          (($j.total_cost_usd // "") | tostring) + "\t" +
-          b64($j.result)
-        else
-          empty
-        end
-      ' 2>/dev/null || true
-    )
-  done
-
-  if [ "$open_text_block" = true ]; then
-    printf "\n"
+  if [ ! -f "$STREAM_RENDERER_SCRIPT" ]; then
+    log_review "Stream renderer script not found at $STREAM_RENDERER_SCRIPT."
+    return 4
   fi
 
-  if [ "$printed_any_text" = false ] && [ -n "$result_text" ]; then
-    printf "%s\n" "$result_text"
+  if [ ${#STREAM_RENDERER_CMD[@]} -eq 0 ]; then
+    log_review "Neither bun nor node found; cannot render stream-json output."
+    return 4
   fi
 
-  if [ "$saw_result" = false ]; then
-    log_review "Stream parser did not receive a final result event."
-    return 3
-  fi
+  log_review "Stream renderer: $(basename "${STREAM_RENDERER_CMD[0]}")."
 
-  if [[ "$result_duration_ms" =~ ^[0-9]+$ ]]; then
-    local duration_seconds
-    duration_seconds="$(awk "BEGIN { printf \"%.1f\", $result_duration_ms / 1000 }")"
-    if [ -n "$result_cost" ] && [ "$result_cost" != "null" ]; then
-      log_review "Claude finished in ${duration_seconds}s (cost \$${result_cost})."
-    else
-      log_review "Claude finished in ${duration_seconds}s."
-    fi
-  else
-    log_review "Claude finished."
-  fi
-
-  if [ "$result_error" = "true" ]; then
-    if [ -n "$result_text" ]; then
-      log_review "Claude reported an error: $(shorten_line "$(sanitize_line "$result_text")" 180)"
-    fi
-    return 1
-  fi
+  REVIEW_LIVE_PREVIEW_MIN_CHARS="$REVIEW_LIVE_PREVIEW_MIN_CHARS" \
+    REVIEW_LIVE_PREVIEW_INTERVAL_SEC="$REVIEW_LIVE_PREVIEW_INTERVAL_SEC" \
+    REVIEW_LIVE_PREVIEW_MIN_EMIT_CHARS="$REVIEW_LIVE_PREVIEW_MIN_EMIT_CHARS" \
+    "${STREAM_RENDERER_CMD[@]}"
 }
 
 run_claude_prompt() {
@@ -337,7 +83,7 @@ run_claude_prompt() {
 
   local claude_flags=("${CLAUDE_FLAGS[@]}")
 
-  if [ "$REVIEW_STREAM_JSON" = "1" ] && command -v jq >/dev/null 2>&1; then
+  if [ "$REVIEW_STREAM_JSON" = "1" ]; then
     claude_flags+=(--output-format=stream-json --include-partial-messages --verbose)
     log_review "Streaming Claude output (set REVIEW_STREAM_JSON=0 to disable)."
     set +e
@@ -377,9 +123,6 @@ run_claude_prompt() {
       printf "%s" "$prompt" | claude "${retry_flags[@]}"
     fi
   else
-    if [ "$REVIEW_STREAM_JSON" = "1" ] && ! command -v jq >/dev/null 2>&1; then
-      log_review "jq not found; falling back to plain text output."
-    fi
     printf "%s" "$prompt" | claude "${claude_flags[@]}"
   fi
 }

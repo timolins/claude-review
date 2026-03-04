@@ -52,7 +52,7 @@ You can also tune live preview verbosity (stream mode):
 REVIEW_LIVE_PREVIEW_MIN_CHARS=160 REVIEW_LIVE_PREVIEW_MIN_EMIT_CHARS=60 REVIEW_LIVE_PREVIEW_INTERVAL_SEC=0 ~/.agents/skills/claude-review/scripts/review.sh
 ```
 
-`REVIEW_LIVE_PREVIEW_INTERVAL_SEC=0` keeps previews event-driven (newlines/sentence boundaries/message end).  
+`REVIEW_LIVE_PREVIEW_INTERVAL_SEC=0` keeps previews event-driven (newlines/message end).  
 Set it to `>0` only if you want periodic timer-based previews for very long single-line outputs.
 
 Live progress is enabled by default (Claude stream JSON is parsed and shown as it runs).  
@@ -62,7 +62,8 @@ Set `REVIEW_STREAM_JSON=0` to fall back to plain `claude --print` output:
 REVIEW_STREAM_JSON=0 ~/.agents/skills/claude-review/scripts/review.sh
 ```
 
-If stream parsing fails at runtime (for example, local renderer/jq issues), the script now auto-retries once in plain output mode so reviews still complete.
+Stream rendering is handled by `scripts/render-stream.mjs` (Bun first, Node fallback).  
+If stream parsing fails at runtime, the script auto-retries once in plain output mode so reviews still complete.
 
 ## How it works
 
