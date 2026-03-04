@@ -26,6 +26,7 @@ fi
 CLAUDE_FLAGS=(--print --allowedTools "Read,Grep,Glob,Bash(git:*)")
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STREAM_RENDERER_SCRIPT="$SCRIPT_DIR/render-stream.mjs"
+PROMPT_TEMPLATE_FILE="$SCRIPT_DIR/review-prompt.md"
 STREAM_RENDERER_CMD=()
 
 if command -v bun >/dev/null 2>&1; then
@@ -72,6 +73,50 @@ render_stream_json() {
     REVIEW_LIVE_PREVIEW_INTERVAL_SEC="$REVIEW_LIVE_PREVIEW_INTERVAL_SEC" \
     REVIEW_LIVE_PREVIEW_MIN_EMIT_CHARS="$REVIEW_LIVE_PREVIEW_MIN_EMIT_CHARS" \
     "${STREAM_RENDERER_CMD[@]}"
+}
+
+build_initial_review_prompt() {
+  if [ ! -f "$PROMPT_TEMPLATE_FILE" ]; then
+    log_review "Prompt template not found at $PROMPT_TEMPLATE_FILE."
+    return 1
+  fi
+
+  local template
+  template="$(cat "$PROMPT_TEMPLATE_FILE")"
+
+  local uncommitted_section=""
+  if [ -n "$UNCOMMITTED_STAT" ] || [ -n "$STAGED_STAT" ]; then
+    uncommitted_section="
+Uncommitted changes stat:
+$UNCOMMITTED_STAT
+
+Uncommitted changes:
+$UNCOMMITTED_TRUNCATED
+
+Staged changes stat:
+$STAGED_STAT
+
+Staged changes:
+$STAGED_TRUNCATED"
+  fi
+
+  local goal_section
+  if [ -n "$MESSAGE" ]; then
+    goal_section="## Stated goal
+$MESSAGE"
+  else
+    goal_section="## Goal
+Infer the goal from the commit messages and diff above."
+  fi
+
+  template="${template//__COMMIT_LOG__/$LOG}"
+  template="${template//__BASE_BRANCH__/$BASE_BRANCH}"
+  template="${template//__DIFF_STAT__/$DIFF_STAT}"
+  template="${template//__DIFF_TRUNCATED__/$DIFF_TRUNCATED}"
+  template="${template//__UNCOMMITTED_SECTION__/$uncommitted_section}"
+  template="${template//__GOAL_SECTION__/$goal_section}"
+
+  printf "%s" "$template"
 }
 
 run_claude_prompt() {
@@ -181,98 +226,6 @@ DIFF_TRUNCATED="$(truncate_text "$DIFF" "$MAX_DIFF_CHARS" "branch diff")"
 UNCOMMITTED_TRUNCATED="$(truncate_text "$UNCOMMITTED" "$MAX_WORKTREE_CHARS" "uncommitted diff")"
 STAGED_TRUNCATED="$(truncate_text "$STAGED" "$MAX_WORKTREE_CHARS" "staged diff")"
 
-PROMPT="You are a coding peer — a second pair of eyes, not a gatekeeper. The developer who wrote this code is your equal. Your job is to think critically about the changes and start a discussion, not hand down a verdict.
-
-## Your approach
-
-- Raise concerns as questions and suggestions, not commands. \"Have you considered...\" not \"You must...\".
-- Acknowledge when something is done well. Don't only point out problems.
-- If something looks off, explain your reasoning. The author may have context you don't.
-- Be open to being wrong. If the author pushes back with a good argument, concede.
-- Focus on what actually matters: correctness, clarity, simplicity. Don't nitpick style or preferences.
-- When suggesting an alternative, explain WHY it might be better, not just WHAT to change.
-- BUT: don't be a pushover. If you see something genuinely wrong or messy, say so clearly. Push back when the author's reasoning doesn't hold up.
-- Don't walk past broken windows. If the changes pile onto an already messy area, or make an existing problem worse, call it out. Suggest a refactor if the area would benefit from one — even if it's beyond the strict scope of the current changes. The codebase should get better over time, not worse.
-
-## What to look at
-
-### Does it achieve the goal?
-- What is the stated/inferred goal?
-- Do the changes accomplish it? Flag specific gaps if not.
-- Edge cases or scenarios that might be missed?
-
-### Could it be simpler or cleaner?
-- Unnecessary complexity? Overcomplicated abstractions?
-- Naming that's unclear or misleading?
-- Dead code, unused imports, leftover debugging?
-- Would a new team member understand this easily?
-- Any security concerns?
-
-### Opportunities to consolidate or restructure
-- Duplication that could be extracted?
-- Existing code in the codebase that could have been reused?
-- Anything in the wrong file or layer?
-- If you were to refactor the entire codebase, would it still look like this?
-- Don't be afraid to suggest a refactor if the area would benefit from one — even if it's beyond the strict scope of the current changes. The codebase should get better over time, not worse.
-
-## Context
-
-Commit log:
-$LOG
-
-Branch diff stat ($BASE_BRANCH...HEAD):
-$DIFF_STAT
-
-Branch diff:
-$DIFF_TRUNCATED"
-
-if [ -n "$UNCOMMITTED_STAT" ] || [ -n "$STAGED_STAT" ]; then
-  PROMPT="$PROMPT
-
-Uncommitted changes stat:
-$UNCOMMITTED_STAT
-
-Uncommitted changes:
-$UNCOMMITTED_TRUNCATED
-
-Staged changes stat:
-$STAGED_STAT
-
-Staged changes:
-$STAGED_TRUNCATED"
-fi
-
-if [ -n "$MESSAGE" ]; then
-  PROMPT="$PROMPT
-
-## Stated goal
-$MESSAGE"
-else
-  PROMPT="$PROMPT
-
-## Goal
-Infer the goal from the commit messages and diff above."
-fi
-
-PROMPT="$PROMPT
-
-## Output format
-
-**Goal**: [what these changes are trying to do]
-
-**Overall impression**: A few sentences on your read of the changes.
-
-**Discussion points** (ordered by importance):
-For each point:
-- **file:line** — what you noticed, why it matters, and what you'd suggest. Frame as a question or suggestion where appropriate.
-
-**Things done well**:
-- Call out anything that's particularly clean, clever, or well-structured.
-
-End with a clear summary: are these changes ready as-is, or are there things worth discussing before shipping?
-
-Read additional files for context if the diff alone is not sufficient.
-
-When diff content is truncated, prefer using the allowed git tools to inspect exact lines before making strong claims."
+PROMPT="$(build_initial_review_prompt)"
 
 run_claude_prompt "$PROMPT"

@@ -65,6 +65,8 @@ REVIEW_STREAM_JSON=0 ~/.agents/skills/claude-review/scripts/review.sh
 Stream rendering is handled by `scripts/render-stream.mjs` (Bun first, Node fallback).  
 If stream parsing fails at runtime, the script auto-retries once in plain output mode so reviews still complete.
 
+The review instruction prompt is stored in `scripts/review-prompt.md` and loaded by `scripts/review.sh`, so you can tweak review behavior without editing bash logic.
+
 ## How it works
 
 1. First run: collects branch diff, uncommitted changes, and commit log. Sends to Claude in `--print --output-format=stream-json` mode (when available), surfaces live progress/tool activity, and saves the session ID to `.review-session`.
